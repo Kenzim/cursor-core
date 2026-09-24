@@ -4,6 +4,9 @@
 #   SONAR_HOST_URL  - base URL of your SonarQube server
 #   SONAR_TOKEN     - project or global analysis token from SonarQube
 #
+# Dependency CVEs: OWASP Dependency-Check runs in this job before sonar-scanner.
+# JSON+HTML are imported by sonar-dependency-check-plugin (More → Dependency-Check).
+#
 # Checkout uses the LAN Forgejo URL. Default https://git.stackken.com hairpins
 # through the public IP and a rootless slirp4netns path.
 
@@ -19,9 +22,14 @@ on:
 jobs:
   sonarqube:
     runs-on: docker
-    timeout-minutes: 45
+    timeout-minutes: 60
     container:
       image: ghcr.io/catthehacker/ubuntu:act-latest
+      volumes:
+        - /home/runner/.cache/dependency-check:/dependency-check-cache
+        # Persist scanner engine + plugin JARs. Fresh containers otherwise
+        # re-download ~50MB over HTTP/2 and hang on this slirp4netns runner.
+        - /home/runner/.cache/sonar:/root/.sonar
     steps:
       # Full history from LAN Forgejo. Avoid actions/checkout: data.forgejo.org
       # TLS flakes (gnutls SNI) on this runner, and HTTPS git.stackken.com hairpins WAN.
@@ -74,11 +82,66 @@ jobs:
           python3 -m pytest tests \
             --cov=cursor_core --cov-report=xml:coverage.xml -q
 
+      # OWASP Dependency-Check: JSON+HTML for sonar-dependency-check-plugin.
+      - name: OWASP Dependency-Check
+        id: dependency-check
+        if: steps.checkout.outcome == 'success'
+        timeout-minutes: 15
+        env:
+          DC_VERSION: "12.1.0"
+        run: |
+          set -eu
+          DC_BIN="/dependency-check-cache/tool/dependency-check/bin/dependency-check.sh"
+          DC_DATA="/dependency-check-cache/data"
+          mkdir -p "/dependency-check-cache/tool" "${DC_DATA}"
+
+          # Tool zip is cached on the runner; OpenJDK is not. Always install Java.
+          apt-get update -qq
+          apt-get install -y -qq curl unzip ca-certificates openjdk-17-jre-headless
+
+          if [ ! -x "${DC_BIN}" ]; then
+            curl -fsSL "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VERSION}/dependency-check-${DC_VERSION}-release.zip" \
+              -o "${RUNNER_TEMP}/dependency-check.zip"
+            rm -rf "/dependency-check-cache/tool"
+            unzip -q "${RUNNER_TEMP}/dependency-check.zip" -d "/dependency-check-cache/tool"
+            DC_BIN="/dependency-check-cache/tool/dependency-check/bin/dependency-check.sh"
+          fi
+
+          if [ -x /usr/lib/jvm/java-17-openjdk-amd64/bin/java ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          else
+            export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+          fi
+          export PATH="${JAVA_HOME}/bin:${PATH}"
+          test -x "${JAVA_HOME}/bin/java"
+          echo "JAVA_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+          echo "${JAVA_HOME}/bin" >> "${GITHUB_PATH}"
+
+          DC_ARGS=(
+            --project "${GITHUB_REPOSITORY##*/}"
+            --scan .
+            --format JSON
+            --format HTML
+            --out .
+            --data "${DC_DATA}"
+            --disableOssIndex
+            --exclude "**/tests/**"
+            --exclude "**/.venv/**"
+            --exclude "**/.git/**"
+          )
+          # Empty NVD cache cannot use --noupdate; later runs reuse the volume.
+          if compgen -G "${DC_DATA}/*.mv.db" > /dev/null; then
+            DC_ARGS+=(--noupdate)
+          fi
+
+          "${DC_BIN}" "${DC_ARGS[@]}"
+          test -s dependency-check-report.json
+
       # Run sonar-scanner in the job container. SonarSource `uses:` actions are
       # node24/composite steps; act_runner polls pathcmd.txt via podman archive
       # and hits "context deadline exceeded" on long scans.
       - name: SonarQube Scan
-        if: steps.checkout.outcome == 'success'
+        if: success() && steps.dependency-check.outcome == 'success'
         timeout-minutes: 25
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -111,12 +174,59 @@ jobs:
           export PATH="${JAVA_HOME}/bin:${PATH}"
           JAVA_EXE="$(command -v java)"
 
+          # Prefetch engine + plugins over HTTP/1.1. Scanner 8's OkHttp HTTP/2
+          # path through slirp4netns + WAN hairpin hangs or dies with PROTOCOL_ERROR.
+          export SONAR_USER_HOME="${HOME}/.sonar"
+          CACHE="${SONAR_USER_HOME}/cache"
+          mkdir -p "${CACHE}"
+          serverUrl="${SONAR_HOST_URL%/}"
+
+          echo "Prefetching scanner engine over HTTP/1.1"
+          engine_json="$(curl --http1.1 --retry 4 --retry-delay 2 --max-time 180 -fsSL \
+            -u "${SONAR_TOKEN}:" "${serverUrl}/api/v2/analysis/engine")"
+          engine_name="$(jq -r '.filename' <<< "${engine_json}")"
+          engine_sha="$(jq -r '.sha256' <<< "${engine_json}")"
+          engine_dir="${CACHE}/${engine_sha}"
+          mkdir -p "${engine_dir}"
+          if [ ! -f "${engine_dir}/${engine_name}" ]; then
+            curl --http1.1 --retry 8 --retry-all-errors --retry-delay 3 \
+              --max-time 300 --speed-limit 1000 --speed-time 45 -fL -C - \
+              -u "${SONAR_TOKEN}:" -H "Accept: application/octet-stream" \
+              "${serverUrl}/api/v2/analysis/engine" -o "${engine_dir}/${engine_name}.part"
+            mv "${engine_dir}/${engine_name}.part" "${engine_dir}/${engine_name}"
+          fi
+          echo "Engine cached: ${engine_name}"
+
+          plugins_tsv="$(curl --http1.1 --retry 4 --retry-delay 2 --max-time 60 -fsSL \
+            -u "${SONAR_TOKEN}:" "${serverUrl}/api/plugins/installed" \
+            | jq -r '.plugins[] | [.hash, .key] | @tsv')"
+          while IFS=$'\t' read -r hash key; do
+            dest="${CACHE}/${hash}/sonar-${key}-plugin.jar"
+            mkdir -p "${CACHE}/${hash}"
+            if [ ! -f "${dest}" ]; then
+              echo "Prefetching plugin ${key}"
+              curl --http1.1 --retry 8 --retry-all-errors --retry-delay 3 \
+                --max-time 300 --speed-limit 1000 --speed-time 45 -fL -C - \
+                -u "${SONAR_TOKEN}:" \
+                "${serverUrl}/api/plugins/download?plugin=${key}" -o "${dest}.part" \
+                || exit 1
+              mv "${dest}.part" "${dest}"
+            fi
+          done <<< "${plugins_tsv}"
+          echo "Plugin cache ready"
+
           SCANNER_ARGS=(
             -Dsonar.scanner.skipJreProvisioning=true
             -Dsonar.scanner.javaExePath="${JAVA_EXE}"
+            -Dsonar.userHome="${SONAR_USER_HOME}"
             -Dsonar.host.url="${SONAR_HOST_URL}"
             -Dsonar.token="${SONAR_TOKEN}"
           )
+          test -s dependency-check-report.json
+          SCANNER_ARGS+=(-Dsonar.dependencyCheck.jsonReportPath=dependency-check-report.json)
+          if [ -s dependency-check-report.html ]; then
+            SCANNER_ARGS+=(-Dsonar.dependencyCheck.htmlReportPath=dependency-check-report.html)
+          fi
 
           "${SCANNER_BIN}" "${SCANNER_ARGS[@]}"
 
