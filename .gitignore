@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+.DS_Store
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+.scannerwork/
+.env
+.env.*
+*.pem
+auth.json
