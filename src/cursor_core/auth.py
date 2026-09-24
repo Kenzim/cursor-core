@@ -39,13 +39,16 @@ class AuthError(RuntimeError):
     """Cursor auth token is missing, malformed, or expired (surfaced as HTTP 401)."""
 
 
+_CURSOR_DIR = ".cursor"
+
+
 def _auth_candidate_paths() -> list[Path]:
     """Ordered paths where Cursor may store an access token."""
     home = Path.home()
     return [
         home / ".config" / "cursor" / "auth.json",
-        home / ".cursor" / "auth.json",
-        home / ".cursor" / "cli-config.json",
+        home / _CURSOR_DIR / "auth.json",
+        home / _CURSOR_DIR / "cli-config.json",
     ]
 
 
@@ -90,7 +93,7 @@ def _jwt_exp(token: str) -> float | None:
 
 def read_cli_auth_info() -> dict[str, Any]:
     """Non-secret account metadata from ``~/.cursor/cli-config.json`` (if any)."""
-    path = Path.home() / ".cursor" / "cli-config.json"
+    path = Path.home() / _CURSOR_DIR / "cli-config.json"
     if not path.exists():
         return {}
     try:
@@ -99,6 +102,32 @@ def read_cli_auth_info() -> dict[str, Any]:
         return {}
     info = data.get("authInfo")
     return dict(info) if isinstance(info, dict) else {}
+
+
+def _account_fields(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    nested = data.get("authInfo") if isinstance(data.get("authInfo"), dict) else {}
+    email = nested.get("email") if isinstance(nested.get("email"), str) else None
+    display = nested.get("displayName") if isinstance(nested.get("displayName"), str) else None
+    return email, display
+
+
+def _auth_status(
+    *,
+    authenticated: bool,
+    email: str | None,
+    display_name: str | None,
+    expires_at: float | None,
+    auth_path: str | None,
+    error: str | None,
+) -> dict[str, Any]:
+    return {
+        "authenticated": authenticated,
+        "email": email,
+        "display_name": display_name,
+        "expires_at": expires_at,
+        "auth_path": auth_path,
+        "error": error,
+    }
 
 
 def peek_auth() -> dict[str, Any]:
@@ -124,53 +153,49 @@ def peek_auth() -> dict[str, Any]:
             continue
         if not isinstance(data, dict):
             continue
-        # Prefer email/display from cli-config even when token lives elsewhere.
-        nested = data.get("authInfo") if isinstance(data.get("authInfo"), dict) else {}
-        if not email and isinstance(nested.get("email"), str):
-            email = nested["email"]
-        if not display_name and isinstance(nested.get("displayName"), str):
-            display_name = nested["displayName"]
+        nested_email, nested_display = _account_fields(data)
+        email = email or nested_email
+        display_name = display_name or nested_display
 
         token = _token_from_mapping(data)
         if not token:
             continue
         exp = _jwt_exp(token)
         if exp is not None and exp <= time.time():
-            return {
-                "authenticated": False,
-                "email": email,
-                "display_name": display_name,
-                "expires_at": exp,
-                "auth_path": str(path),
-                "error": "access token expired",
-            }
-        return {
-            "authenticated": True,
-            "email": email,
-            "display_name": display_name,
-            "expires_at": exp,
-            "auth_path": str(path),
-            "error": None,
-        }
+            return _auth_status(
+                authenticated=False,
+                email=email,
+                display_name=display_name,
+                expires_at=exp,
+                auth_path=str(path),
+                error="access token expired",
+            )
+        return _auth_status(
+            authenticated=True,
+            email=email,
+            display_name=display_name,
+            expires_at=exp,
+            auth_path=str(path),
+            error=None,
+        )
 
-    # cli-config may show an account even if no bearer token file is present.
     if email or display_name:
-        return {
-            "authenticated": False,
-            "email": email,
-            "display_name": display_name,
-            "expires_at": None,
-            "auth_path": None,
-            "error": last_error or "no access token found",
-        }
-    return {
-        "authenticated": False,
-        "email": None,
-        "display_name": None,
-        "expires_at": None,
-        "auth_path": None,
-        "error": last_error or "Cursor auth not found",
-    }
+        return _auth_status(
+            authenticated=False,
+            email=email,
+            display_name=display_name,
+            expires_at=None,
+            auth_path=None,
+            error=last_error or "no access token found",
+        )
+    return _auth_status(
+        authenticated=False,
+        email=None,
+        display_name=None,
+        expires_at=None,
+        auth_path=None,
+        error=last_error or "Cursor auth not found",
+    )
 
 
 def peek_token(

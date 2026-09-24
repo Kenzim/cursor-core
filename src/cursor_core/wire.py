@@ -399,7 +399,7 @@ def _parse_kv_server_message(data: bytes, msg: ServerMsg):
             msg.kv_op = "set"
             p2 = 0
             while (r2 := _read_field(val, p2)) is not None:
-                f2, w2, v2, p2 = r2
+                f2, _, v2, p2 = r2
                 if f2 == 1:
                     msg.kv_blob_id = v2
                 elif f2 == 2:
@@ -1645,7 +1645,7 @@ def build_grep_success_response(
 def build_grep_error_response(
     exec_id: int,
     exec_id_str: str,
-    search_path: str,
+    _search_path: str,
     error: str,
 ) -> bytes:
     """agent.v1.GrepResult{2: GrepError{1: error}}."""

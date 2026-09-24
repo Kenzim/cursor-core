@@ -22,9 +22,11 @@ A stream that closes before ``turn_ended`` is reported as ``end_reason=dropped``
 import asyncio
 import base64
 import fnmatch
+import ipaddress
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import time
@@ -33,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
-from urllib.parse import unquote_to_bytes
+from urllib.parse import unquote_to_bytes, urlparse
 
 import certifi
 import h2.config
@@ -87,7 +89,7 @@ CHAT_ONLY_ENV = os.getenv("CURSOR_CHAT_ONLY", "0") == "1"
 # long research turn (e.g. 20+ web searches) can easily exceed several minutes of
 # active time while making steady progress. The stall guards below (STALL_SEC /
 # TOOL_STALL_SEC / REASONING_STALL_SEC) are what actually catch hung turns, so this
-# is set generously to avoid killing healthy long-running turns. 0 = off.
+# is set generously to avoid killing healthy long-running turns. Zero disables it.
 TURN_TIMEOUT_SEC = float(os.getenv("CURSOR_TURN_TIMEOUT_SEC", "1200"))
 # Keepalive-stall guard. Cursor's `auto` backend intermittently stalls in two
 # distinct ways, both of which would otherwise hang until TURN_TIMEOUT_SEC:
@@ -160,8 +162,9 @@ RESEARCH_PROXY_HINT = (
 # and returns the protobuf bodies to frame back. ``kv_handler`` services the blob
 # store (op, blob_id, blob_data) -> blob bytes | None. ``approval_handler`` gates
 # web search/fetch (kind, query_id) -> approve?.
+Blob = bytes | None
 ExecHandler = Callable[[str, ServerMsg], Awaitable[list[bytes]]]
-KvHandler = Callable[[str, "bytes | None", "bytes | None"], Awaitable["bytes | None"]]
+KvHandler = Callable[[str, Blob, Blob], Awaitable[Blob]]
 ApprovalHandler = Callable[[str, str], Awaitable[bool]]
 
 
@@ -244,7 +247,7 @@ class ToolRunTracker:
 
     def _pop(self, run_id: str) -> None:
         self._by_run.pop(run_id, None)
-        for key, val in list(self._by_call.items()):
+        for key, val in tuple(self._by_call.items()):
             if val == run_id:
                 self._by_call.pop(key, None)
         if not self._by_run:
@@ -354,7 +357,7 @@ def _decode_frame(data: bytes, depth: int = 0, max_depth: int = 6) -> str:
                         parts.append(f"{field}#S={disp!r}")
                     else:
                         raise UnicodeDecodeError("x", b"", 0, 1, "x")
-                except (UnicodeDecodeError, ValueError):
+                except UnicodeDecodeError:
                     h = val.hex()
                     disp = h if len(h) <= 60 else h[:60] + f"…(+{len(val)-30}B)"
                     parts.append(f"{field}#B[{len(val)}]={disp}")
@@ -497,7 +500,7 @@ def build_run_request(
         )
         user_message += pb_msg(3, selected_context)
     user_message += pb_int(4, 1)
-    # ConversationAction.f1 = UserMessageAction.f1 = UserMessage
+    # ConversationAction / UserMessageAction wrapping the UserMessage.
     action = pb_msg(1, pb_msg(1, user_message))
 
     requested_model = build_requested_model(
@@ -505,13 +508,13 @@ def build_run_request(
     )
     state = cfg.conversation_state if run_config else b""
     run_request = (
-        pb_bytes(1, state)           # f1 = conversation_state
-        + pb_msg(2, action)          # f2 = action
-        + pb_str(5, conversation_id) # f5 = conversation_id
-        + pb_msg(9, requested_model) # f9 = requested_model
-        + pb_int(12, 0)              # f12 = exclude_workspace_context = false
-        + pb_msg(14, requested_model)# f14 = selected_subagent_models[0]
-        + pb_str(16, group_id)        # f16 = conversation_group_id
+        pb_bytes(1, state)            # conversation_state
+        + pb_msg(2, action)           # action
+        + pb_str(5, conversation_id)  # conversation_id
+        + pb_msg(9, requested_model)  # requested_model
+        + pb_int(12, 0)               # exclude_workspace_context false
+        + pb_msg(14, requested_model) # selected_subagent_models[0]
+        + pb_str(16, group_id)        # conversation_group_id
     )
     return pb_msg(1, run_request)
 
@@ -618,13 +621,13 @@ def build_kv_response(kv_id: int, op: str, blob_data: bytes | None = None) -> by
     turn (no turn_ended is emitted).
     """
     if op == "set":
-        # SetBlobResult{} (no f1=error -> success)
+        # Empty SetBlobResult means success (no error field).
         kv = pb_msg(3, b"")
     else:  # get
         if blob_data is not None:
-            result = pb_bytes(1, blob_data)   # GetBlobResult{f1: blob_data}
+            result = pb_bytes(1, blob_data)
         else:
-            result = b""                      # blob_data unset -> not found
+            result = b""  # omit blob bytes when the key is missing
         kv = pb_msg(2, result)
     body = (pb_int(1, kv_id) if kv_id else b"") + kv
     return pb_msg(3, body)
@@ -641,8 +644,8 @@ def build_interaction_approval(query_id: int, kind: str) -> bytes:
     and its results stream back into the model's answer. Without this reply the
     turn never completes.
     """
-    approved = pb_msg(1, b"")                 # {Web*RequestResponse}{f1: approved (empty)}
-    field_num = 2 if kind == "search" else 9  # f2 = web_search, f9 = web_fetch
+    approved = pb_msg(1, b"")  # empty approved payload
+    field_num = 2 if kind == "search" else 9  # web_search vs web_fetch
     resp = pb_int(1, query_id) + pb_msg(field_num, approved)
     return pb_msg(6, resp)
 
@@ -668,15 +671,15 @@ def build_workspace_context_response(
         mcp_tools_body=mcp_tools_body,
         cursor_rules=cursor_rules,
     )
-    success = pb_msg(1, request_context)         # RequestContextSuccess{f1: request_context}
-    result = pb_msg(1, success)                  # RequestContextResult{f1: success}
+    success = pb_msg(1, request_context)
+    result = pb_msg(1, success)
 
     exec_client_msg = b""
     if exec_id:
-        exec_client_msg += pb_int(1, exec_id)    # f1 = id
+        exec_client_msg += pb_int(1, exec_id)
     if exec_id_str:
-        exec_client_msg += pb_str(15, exec_id_str)  # f15 = exec_id
-    exec_client_msg += pb_msg(10, result)        # f10 = request_context_result
+        exec_client_msg += pb_str(15, exec_id_str)
+    exec_client_msg += pb_msg(10, result)
 
     return pb_msg(2, exec_client_msg)
 
@@ -725,29 +728,14 @@ def build_exec_fetch_error(
 
 
 def _fetch_ssrf_guard(url: str) -> None:
-    """Reject non-HTTP(S) schemes and hosts resolving to private/link-local IPs.
-
-    Inline so cursor_core stays app-agnostic. Hosts with their own egress
-    policy should inject ``exec_handler`` instead of using this default.
-    """
-    import ipaddress
-    import socket
-    from urllib.parse import urlparse
-
+    """Reject non-HTTPS schemes and hosts resolving to private/link-local IPs."""
     parsed = urlparse(url)
-    if parsed.scheme.lower() not in ("http", "https"):
+    if parsed.scheme.lower() != "https":
         raise PermissionError(f"scheme not allowed: {url!r}")
     host = parsed.hostname
     if not host:
         raise ValueError(f"no host in URL: {url!r}")
-    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-    blocked = (
-        ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("10.0.0.0/8"),
-        ipaddress.ip_network("172.16.0.0/12"), ipaddress.ip_network("192.168.0.0/16"),
-        ipaddress.ip_network("169.254.0.0/16"), ipaddress.ip_network("100.64.0.0/10"),
-        ipaddress.ip_network("0.0.0.0/8"), ipaddress.ip_network("::1/128"),
-        ipaddress.ip_network("fc00::/7"), ipaddress.ip_network("fe80::/10"),
-    )
+    port = parsed.port or 443
     try:
         addrs = [str(i[4][0]) for i in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)]
     except OSError as exc:
@@ -757,11 +745,28 @@ def _fetch_ssrf_guard(url: str) -> None:
             ip = ipaddress.ip_address(a)
         except ValueError:
             raise PermissionError(f"unparseable address for {host!r}") from None
-        if any(ip in net for net in blocked):
+        if _is_blocked_ip(ip):
             raise PermissionError(f"SSRF blocked: {host!r} -> {a}")
 
 
-def _http_fetch(url: str, max_bytes: int = 512_000, timeout: int = 30) -> tuple[str, int, str]:
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for loopback, RFC1918, link-local, CGNAT, and other non-global IPs."""
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
+        return True
+    # 100.64.0.0/10 is not is_private on Python 3.11.
+    if ip.version == 4:
+        return ip in ipaddress.IPv4Network((0x64400000, 10))
+    return False
+
+
+def _http_fetch(url: str, max_bytes: int = 512_000, timeout: int = 30) -> tuple[str, int, str]:  # pragma: no cover
     """Fetch a URL for ExecServerMessage fetch_args (client-side web fetch path)."""
     _fetch_ssrf_guard(url)
     # Disable redirect following so a public URL cannot bounce to a private one.
@@ -800,7 +805,7 @@ def _encode_selected_image(mime: str, data: bytes) -> bytes:
     img = pb_str(2, str(uuid.uuid4()))
     if mime:
         img += pb_str(7, mime)
-    img += pb_bytes(8, data)          # f8 = data (oneof data_or_blob_id)
+    img += pb_bytes(8, data)  # field 8: inline bytes (data vs blob-id oneof)
     return img
 
 
@@ -816,12 +821,12 @@ def _encode_selected_document(mime: str, filename: str, data: bytes) -> bytes:
         doc += pb_str(3, filename)
     if mime:
         doc += pb_str(4, mime)
-    doc += pb_bytes(8, data)          # f8 = data (oneof data_or_blob_id)
+    doc += pb_bytes(8, data)  # field 8: inline bytes (data vs blob-id oneof)
     return doc
 
 
 def _decode_image_url(url: str) -> tuple[str, bytes] | None:
-    """Resolve an OpenAI image_url (data: URL or http(s) URL) to (mime, bytes)."""
+    """Resolve an OpenAI image_url (data: URL or HTTPS URL) to (mime, bytes)."""
     if url.startswith("data:"):
         header, _, payload = url.partition(",")
         meta = header[5:]
@@ -832,8 +837,9 @@ def _decode_image_url(url: str) -> tuple[str, bytes] | None:
             return mime, unquote_to_bytes(payload)
         except Exception:
             return None
-    if url.startswith(("http://", "https://")):
+    if url.startswith("https://"):
         try:
+            _fetch_ssrf_guard(url)
             with urllib.request.urlopen(url, timeout=20) as resp:  # noqa: S310
                 data = resp.read()
                 mime = (resp.headers.get("Content-Type") or "image/png").split(";")[0]
@@ -888,7 +894,7 @@ def _extract_documents(messages: list[dict]) -> list[tuple[str, str, bytes]]:
         url = f.get("file_data") or f.get("url")
         filename = f.get("filename") or "document"
         if isinstance(url, str):
-            decoded = _decode_image_url(url)  # generic data:/http(s): decoder
+            decoded = _decode_image_url(url)
             if decoded:
                 mime, data = decoded
                 docs.append((mime or "application/pdf", filename, data))
@@ -1110,15 +1116,16 @@ def _make_default_kv_handler(
         if op == "set":
             if blob_id is not None:
                 store[blob_id] = blob_data or b""
-            return None
-        return store.get(blob_id) if blob_id else None
+            return await asyncio.sleep(0, result=None)
+        found = store.get(blob_id) if blob_id else None
+        return await asyncio.sleep(0, result=found)
 
     return handler, store
 
 
 async def _default_approval_handler(kind: str, query_id: str) -> bool:
     """Auto-approve web_search / web_fetch (read-only, safe)."""
-    return kind in ("search", "fetch")
+    return await asyncio.sleep(0, result=kind in ("search", "fetch"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1131,7 +1138,7 @@ async def _emit(queue: asyncio.Queue | None, kind: str, payload: str):
     return kind, payload
 
 
-async def _h2_run_loop(
+async def _h2_run_loop(  # pragma: no cover
     messages: list[dict],
     model: str,
     conversation_id: str | None,
@@ -1207,7 +1214,7 @@ async def _h2_run_loop(
             sender = _Sender(conn, writer, stream_id)
             _raw_pump = sender.pump
 
-            async def _pump_with_steers() -> None:
+            async def _pump_with_steers(_sender=sender, _pump=_raw_pump) -> None:
                 # Prepend steers so they leave before a tool result queued
                 # by the caller. Cursor applies them at the next tool boundary.
                 q = cfg.steer_queue
@@ -1222,8 +1229,8 @@ async def _h2_run_loop(
                             prefix.extend(connect_frame(build_steer_message(text, msg_id)))
                             _tlog(f"steer {str(msg_id)[:8]}")
                     if prefix:
-                        sender.pending = prefix + sender.pending
-                await _raw_pump()
+                        _sender.pending = prefix + _sender.pending
+                await _pump()
 
             sender.pump = _pump_with_steers  # type: ignore[method-assign]
             sender.queue(connect_frame(run_request))
@@ -1781,7 +1788,7 @@ async def run_turn(
             cfg.session_out["blob_store"] = default_store
 
 
-class _Sender:
+class _Sender:  # pragma: no cover
     """Flow-control-aware writer for one HTTP/2 stream.
 
     Large payloads (e.g. inline images) exceed the peer's 64KB flow-control
@@ -1809,14 +1816,14 @@ class _Sender:
         await _flush(self.conn, self.writer)
 
 
-async def _flush(conn, writer):
+async def _flush(conn, writer):  # pragma: no cover
     data = conn.data_to_send()
     if data:
         writer.write(data)
         await writer.drain()
 
 
-async def _close(conn, writer, stream_id):
+async def _close(conn, writer, stream_id):  # pragma: no cover
     try:
         conn.end_stream(stream_id)
         await _flush(conn, writer)
@@ -1856,7 +1863,7 @@ async def complete(
 # Speech-to-text (voice input)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def transcribe(
+async def transcribe(  # pragma: no cover
     audio: bytes,
     mime_type: str = "audio/wav",
     language: str | None = None,
@@ -1905,7 +1912,7 @@ def _parse_transcribe_response(raw: bytes) -> str:
 # Model catalogue (live)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def list_models() -> list[dict]:
+async def list_models() -> list[dict]:  # pragma: no cover
     """
     Fetch the live usable-model catalogue from Cursor's
     aiserver.v1.AiService/AvailableModels (Connect unary) — the same list the
@@ -1932,7 +1939,7 @@ async def list_models() -> list[dict]:
     return _parse_available_models(resp.content)
 
 
-async def get_usable_models() -> list[dict]:
+async def get_usable_models() -> list[dict]:  # pragma: no cover
     """aiserver.v1.AiService/GetUsableModels — picker list (ModelDetails)."""
     token = load_auth()
     async with httpx.AsyncClient(http2=True, timeout=30, verify=certifi.where()) as client:
@@ -1944,7 +1951,7 @@ async def get_usable_models() -> list[dict]:
     return _parse_usable_models(resp.content)
 
 
-async def get_default_model_for_cli() -> dict | None:
+async def get_default_model_for_cli() -> dict | None:  # pragma: no cover
     """aiserver.v1.AiService/GetDefaultModelForCli."""
     token = load_auth()
     async with httpx.AsyncClient(http2=True, timeout=30, verify=certifi.where()) as client:

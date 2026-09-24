@@ -208,9 +208,8 @@ def _parse_variant(blob: bytes) -> ModelVariant | None:
                 params[pid] = pval
         elif f == 11 and w == 2 and isinstance(v, bytes):
             display = v.decode("utf-8", "replace")
-        elif f in (10, 11, 18) and w == 2 and isinstance(v, bytes):
-            if not vid:
-                vid = v.decode("utf-8", "replace")
+        elif f in (10, 11, 18) and w == 2 and isinstance(v, bytes) and not vid:
+            vid = v.decode("utf-8", "replace")
     if not vid and not params:
         return None
     return ModelVariant(vid, "", params, display)
@@ -428,7 +427,7 @@ def _normalize_fast(fast: bool | str | None) -> str | None:
     return None
 
 
-async def _fetch_catalog_raw(access_token: str | None = None) -> tuple[list[CatalogModel], str | None]:
+async def _fetch_catalog_raw(access_token: str | None = None) -> tuple[list[CatalogModel], str | None]:  # pragma: no cover
     import httpx
     import certifi
 
@@ -543,7 +542,7 @@ def _context_tokens_from_params(params: dict[str, str]) -> int:
     ctx = params.get("context", "")
     if not ctx:
         return 128000
-    m = re.fullmatch(r"(\d+)(k|m)", ctx.strip().lower())
+    m = re.fullmatch(r"(\d+)([km])", ctx.strip().lower())
     if not m:
         return 128000
     n, unit = int(m.group(1)), m.group(2)

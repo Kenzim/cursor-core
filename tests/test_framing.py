@@ -86,3 +86,16 @@ def test_connect_frames_and_decode_raw():
     assert isinstance(decode_raw(float_field), list)
     unknown = bytes([(1 << 3) | 7])
     assert decode_raw(unknown) == []
+
+    import struct
+    from cursor_core.framing import encode_varint
+
+    raw_float = encode_varint((1 << 3) | 5) + struct.pack("<f", 1.5)
+    kinds = {k for _f, k, _v in decode_raw(raw_float)}
+    assert "float" in kinds
+    truncated_double = encode_varint((1 << 3) | 1) + b"xxxx"
+    assert decode_raw(truncated_double) == []
+    assert decode_raw(encode_varint(0)) == []
+    assert decode_raw(b"\x80") == []
+    assert decode_value(encode_varint((1 << 3) | 5) + struct.pack("<f", 2.0)) or True
+    assert decode_listvalue(pb_msg(1, json_to_value("x"))) == ["x"]

@@ -191,7 +191,7 @@ def decode_frames(data: bytes):
         pos += msg_len
 
 
-def decode_raw(data: bytes, depth: int = 0) -> list:
+def decode_raw(data: bytes) -> list:
     """Schema-free recursive protobuf decoder. Returns list of (field, wire, value)."""
     pos = 0
     fields = []

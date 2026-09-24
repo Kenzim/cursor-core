@@ -64,16 +64,7 @@ class AgentSession:
         self.client = client
         self.checkpoint = checkpoint or Checkpoint()
 
-    async def run(
-        self,
-        messages: list[dict],
-        model: str = "auto",
-        *,
-        run_config: RunConfig | None = None,
-        exec_handler: ExecHandler | None = None,
-        kv_handler: KvHandler | None = None,
-        approval_handler: ApprovalHandler | None = None,
-    ) -> AsyncIterator[tuple[str, str]]:
+    def _seed_run_config(self, run_config: RunConfig | None) -> RunConfig:
         cfg = run_config or RunConfig()
         if not cfg.conversation_id:
             cfg.conversation_id = self.checkpoint.conversation_id or None
@@ -87,39 +78,58 @@ class AgentSession:
             cfg.access_token = self.client.access_token
         if cfg.session_out is None:
             cfg.session_out = {}
+        return cfg
 
+    def _wrap_kv(self, kv_handler: KvHandler | None) -> KvHandler:
         async def _kv(
             op: str, blob_id: bytes | None, blob_data: bytes | None
         ) -> bytes | None:
             if kv_handler is not None:
                 result = await kv_handler(op, blob_id, blob_data)
+            elif op == "set" and blob_id is not None:
+                self.checkpoint.blobs[blob_id] = blob_data or b""
+                result = None
+            elif op == "get" and blob_id is not None:
+                result = self.checkpoint.blobs.get(blob_id)
             else:
                 result = None
-                if op == "set" and blob_id is not None:
-                    self.checkpoint.blobs[blob_id] = blob_data or b""
-                elif op == "get" and blob_id is not None:
-                    result = self.checkpoint.blobs.get(blob_id)
             if op == "set" and blob_id is not None and kv_handler is not None:
                 self.checkpoint.blobs[blob_id] = blob_data or b""
             return result
 
+        return _kv
+
+    def _remember_checkpoint(self, kind: str, payload: str, cfg: RunConfig) -> None:
+        if kind == "checkpoint" and payload:
+            try:
+                self.checkpoint.state = base64.b64decode(payload)
+            except Exception:
+                pass
+        if cfg.conversation_id:
+            self.checkpoint.conversation_id = cfg.conversation_id
+        if cfg.conversation_group_id:
+            self.checkpoint.group_id = cfg.conversation_group_id
+
+    async def run(
+        self,
+        messages: list[dict],
+        model: str = "auto",
+        *,
+        run_config: RunConfig | None = None,
+        exec_handler: ExecHandler | None = None,
+        kv_handler: KvHandler | None = None,
+        approval_handler: ApprovalHandler | None = None,
+    ) -> AsyncIterator[tuple[str, str]]:
+        cfg = self._seed_run_config(run_config)
         async for kind, payload in run_turn(
             messages,
             model,
             run_config=cfg,
             exec_handler=exec_handler,
-            kv_handler=_kv if kv_handler is None else kv_handler,
+            kv_handler=self._wrap_kv(kv_handler),
             approval_handler=approval_handler,
         ):
-            if kind == "checkpoint" and payload:
-                try:
-                    self.checkpoint.state = base64.b64decode(payload)
-                except Exception:
-                    pass
-            if cfg.conversation_id:
-                self.checkpoint.conversation_id = cfg.conversation_id
-            if cfg.conversation_group_id:
-                self.checkpoint.group_id = cfg.conversation_group_id
+            self._remember_checkpoint(kind, payload, cfg)
             yield kind, payload
 
 
